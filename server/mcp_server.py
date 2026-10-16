@@ -26,27 +26,97 @@ except ImportError:
 
 DIALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ask_dialog.py")
 STATE_DIR = claw.STATE_DIR
-PRE_ANSWER_PATH = os.path.join(STATE_DIR, "pre-answer.json")
-HOLD_PATH = os.path.join(STATE_DIR, "hold.json")
 
 
-def _take_hold():
-    """用户在 Claude 界面点了「我在想」——取走这个信号，别再惊动微信。"""
+def _signal_path(kind, ask_id):
+    """每个会话的信号文件各自独立。
+
+    多开会话时若共用一份，A 会吃到 B 的答案（你点 B 的卡片，A 也读到并结束）。
+    ask_id 由 plugin 在 session.start 生成，没传就退回共享名（tkinter/elicitation 路径）。
+    """
+    return os.path.join(STATE_DIR, f"{kind}-{ask_id}.json" if ask_id else f"{kind}.json")
+
+
+SEND_LOCK_PATH = os.path.join(STATE_DIR, "send.lock")
+# 持锁者多久没动静就当作已死，让等待者接管，免得崩溃后整条队列卡死
+LOCK_STALE_SECONDS = 45
+
+
+def _lock_owner():
     try:
-        os.remove(HOLD_PATH)
+        with open(SEND_LOCK_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _touch_lock(ask_id):
+    """持锁期间定期刷新，向等待者证明自己还活着。"""
+    try:
+        with open(SEND_LOCK_PATH, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "ask_id": ask_id, "at": time.time()}, f)
     except OSError:
-        return False
+        pass
+
+
+def _try_acquire_lock(ask_id):
+    """尝试拿到微信推送权。拿到返回 True。
+
+    微信的 getupdates 游标是账号级的、只有一份，两个会话同时推就等于互相抢答复。
+    所以推送和等待答复这段必须串行——这也是「问题排队」的全部实现。
+    """
+    try:
+        fd = os.open(SEND_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(SEND_LOCK_PATH)
+        except OSError:
+            return False
+        if age <= LOCK_STALE_SECONDS:
+            return False
+        # 持锁者已经死了（心跳停了），接管
+        _log_error({"stale_lock_taken_over": _lock_owner(), "ageSeconds": round(age, 1)})
+        try:
+            os.remove(SEND_LOCK_PATH)
+        except OSError:
+            return False
+
+        return _try_acquire_lock(ask_id)
+
+    os.write(fd, b"{}")
+    os.close(fd)
+    _touch_lock(ask_id)
+
     return True
 
 
-async def _wait_unless_held(delay):
-    """等 delay 秒再推微信；期间收到 hold 信号就返回 False，放弃推送。"""
-    deadline = time.monotonic() + delay
-    while time.monotonic() < deadline:
-        if _take_hold():
-            return False
-        await asyncio.sleep(0.25)
+def _release_lock(ask_id):
+    """只释放自己的锁，不碰别人接管后的那把。"""
+    owner = _lock_owner()
+    if owner.get("ask_id") and owner["ask_id"] != ask_id:
+        return
+    try:
+        os.remove(SEND_LOCK_PATH)
+    except OSError:
+        pass
 
+
+async def _acquire_lock(ask_id, deadline):
+    """排队等锁，等到 deadline 为止。返回 False 表示这一轮没轮上。"""
+    while time.monotonic() < deadline:
+        if _try_acquire_lock(ask_id):
+            return True
+        await asyncio.sleep(0.5)
+
+    return False
+
+
+def _take_hold(ask_id):
+    """用户在 Claude 界面点了「我在想」——取走这个信号，别再惊动微信。"""
+    try:
+        os.remove(_signal_path("hold", ask_id))
+    except OSError:
+        return False
     return True
 
 
@@ -65,16 +135,17 @@ def _log_error(info):
 CANCELLED = "\x00cancelled"
 
 
-def _take_pre_answer():
-    """取走 wechat-ask-ui plugin 在 Claude 界面里问到的答案。
+def _take_pre_answer(ask_id):
+    """取走 plugin 在 Claude 界面里问到的答案。
 
     plugin 无法直接替工具产出结果（返回 {result} 不被采纳），所以改由它留下
-    答案、这里取走。取一次即删，并且只认 10 秒内写的，避免读到上一轮的残留。
+    答案、这里取走。取一次即删，并且只认 60 秒内写的，避免读到上一轮的残留。
     """
+    path = _signal_path("pre-answer", ask_id)
     try:
-        with open(PRE_ANSWER_PATH, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        os.remove(PRE_ANSWER_PATH)
+        os.remove(path)
     except (OSError, ValueError):
         return None
 
@@ -102,14 +173,14 @@ def _resolve_option(text, options):
 ELICIT_UNAVAILABLE = object()
 
 
-async def _poll_pre_answer():
-    """等 wechat-ask-ui plugin 把用户在 Claude 界面里的点击写进来。
+async def _poll_pre_answer(ask_id):
+    """等 plugin 把用户在 Claude 界面里的点击写进来。
 
     plugin 的 hook 只有 10 秒预算，没法自己等人回答（超时引擎会替它放行），
     所以等待这件事必须落在这边——这里没有预算限制。
     """
     while True:
-        answer = _take_pre_answer()
+        answer = _take_pre_answer(ask_id)
         if answer:
             return answer
         await asyncio.sleep(0.2)
@@ -176,30 +247,47 @@ async def _ask_local(question, options, closed_event):
     return answer
 
 
-async def _ask_wechat(cfg, question, options, delay, closed_event, state, allow_hold=False):
+async def _ask_wechat(cfg, question, options, delay, closed_event, state, ask_id, deadline):
+    allow_hold = ask_id is not None
+
+    # 等本地：plugin 路径要一直轮询 hold 信号，别的路径只等 closed_event
     if allow_hold:
-        if not await _wait_unless_held(max(0, delay)):
-            state["held"] = True
-            return None
+        end = time.monotonic() + max(0, delay)
+        while time.monotonic() < end:
+            if _take_hold(ask_id):
+                state["held"] = True
+                return None
+            await asyncio.sleep(0.25)
     else:
         try:
             await asyncio.wait_for(closed_event.wait(), timeout=max(0, delay))
         except asyncio.TimeoutError:
             pass
 
-    text = question
-    if options:
-        listed = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
-        text = f"{question}\n\n{listed}\n\n直接回复内容或序号。"
-    await asyncio.to_thread(claw.send_message, cfg, text)
-    state["pushed"] = True
+    # 排队：同一时刻只让一个会话占用微信，否则两个 getupdates 会互相吃掉答复
+    if not await _acquire_lock(ask_id, deadline):
+        state["lock_timeout"] = True
+        return None
 
-    async with _poll_lock:
-        while True:
-            for m in await asyncio.to_thread(claw.poll_once, cfg):
-                reply = claw.msg_text(m)
-                if reply:
-                    return _resolve_option(reply, options)
+    try:
+        text = question
+        if options:
+            listed = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
+            text = f"{question}\n\n{listed}\n\n直接回复内容或序号。"
+        await asyncio.to_thread(claw.send_message, cfg, text)
+        state["pushed"] = True
+
+        async with _poll_lock:
+            while True:
+                if time.monotonic() >= deadline:
+                    return None
+                _touch_lock(ask_id)  # 心跳，让排队的下一个知道我还在等
+                for m in await asyncio.to_thread(claw.poll_once, cfg):
+                    reply = claw.msg_text(m)
+                    if reply:
+                        return _resolve_option(reply, options)
+    finally:
+        _release_lock(ask_id)
 
 
 @server.tool(
@@ -216,6 +304,7 @@ async def ask_remote(
     options: list[str] | None = None,
     local_wait_seconds: float = 30,
     timeout_seconds: float = 600,
+    ask_id: str | None = None,
 ) -> str:
     """向用户提问，本地弹窗与微信双通道竞速。
 
@@ -224,6 +313,8 @@ async def ask_remote(
         options: 可选的候选项；会变成弹窗按钮，微信端可回复序号。
         local_wait_seconds: 等本地多久没动静才推微信，默认 30 秒。
         timeout_seconds: 总超时，默认 600 秒。
+        ask_id: 内部用，由 wechat-ask 插件注入的会话标识（隔离多会话的信号文件）。
+            调用方不要传。
     """
     if question == "__debug__":
         caps = getattr(ctx, "client_capabilities", None)
@@ -249,17 +340,21 @@ async def ask_remote(
     state = {"pushed": False, "local_kind": "本地弹窗"}
     closed_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
 
-    # 负数：wechat-ask-ui plugin 已在 Claude 界面里发问，答案会落到 pre-answer.json，
+    # 负数：plugin 已在 Claude 界面里发问，答案会落到 pre-answer-<ask_id>.json，
     # 绝对值是推微信前的等待秒数
-    allow_hold = local_wait_seconds < 0
-    if allow_hold:
+    plugin_ui = local_wait_seconds < 0
+    if plugin_ui:
         state["local_kind"] = "Claude 界面"
         delay = -local_wait_seconds
-        _take_hold()  # 丢掉上一轮可能残留的信号
-        local = asyncio.create_task(_poll_pre_answer())
+        _take_hold(ask_id)  # 丢掉上一轮可能残留的信号
+        local = asyncio.create_task(_poll_pre_answer(ask_id))
+        # 微信那边要排队，锁得按墙钟时间等，所以传单调时钟的截止点
+        wechat_deadline = time.monotonic() + timeout_seconds
     else:
         delay = local_wait_seconds
+        wechat_deadline = time.monotonic() + timeout_seconds
         # 客户端声明了 elicitation 不代表真能用，走不通时 _ask_local_channel 会退回本地窗口
         native = bool(getattr(getattr(ctx, "client_capabilities", None), "elicitation", None))
         local = asyncio.create_task(
@@ -267,7 +362,9 @@ async def ask_remote(
         )
 
     remote = asyncio.create_task(
-        _ask_wechat(cfg, question, options, delay, closed_event, state, allow_hold=allow_hold)
+        _ask_wechat(
+            cfg, question, options, delay, closed_event, state, ask_id, wechat_deadline
+        )
     )
     pending = {local, remote}
 
@@ -307,6 +404,11 @@ async def ask_remote(
         if state.get("held"):
             return (
                 f"用户点了「我在想」取消了微信推送，但最终没有在 {timeout_seconds:.0f} 秒内回答。"
+            )
+        if state.get("lock_timeout"):
+            return (
+                f"另一个会话正占用微信等待用户回复，本次排到 {timeout_seconds:.0f} 秒也没轮上。"
+                "可以稍后重试。"
             )
         return f"用户未在 {timeout_seconds:.0f} 秒内回答（本地弹窗和微信都没有响应）。"
 

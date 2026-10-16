@@ -94,7 +94,21 @@ const cardSvg = (question: string, options: string[], held: boolean) => {
 
 const pending = atom({ plugin: 'wechat-ask', key: 'pending' } as const, null as Pending)
 
+// 会话标识：getupdates 的游标是账号级的，多开会话时信号文件必须各自独立，
+// 否则 A 会读到 B 的答案（你点 B 的卡片，A 也跟着结束）。
+let askId: string | null = null
+
+const signalPath = async (
+  $: { env: { get: (n: string) => Promise<string | undefined> } },
+  kind: string,
+) => `${await stateDir($)}/${kind}${askId ? `-${askId}` : ''}.json`
+
 export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    askId = (await $.session.id()) ?? null
+
+    return next(e)
+  })
 
   on('tool.call', async ($, e, next) => {
     if (!String(e.tool).includes('ask_remote')) {
@@ -114,8 +128,8 @@ export const register: Register = on => {
     try {
       // 不在这里等人回答：hook 每次 dispatch 只有 10 秒预算，超了引擎就判定它
       // 缺席并替它放行。next() 飞行期间预算暂停，所以等待交给 MCP server——
-      // 它去轮询 pre-answer.json，没有时间限制。负数是给它的信号。
-      return await next({ ...e, local_wait_seconds: -waitSeconds })
+      // 它去轮询按会话隔离的信号文件，没有时间限制。负数是给它的信号。
+      return await next({ ...e, local_wait_seconds: -waitSeconds, ask_id: askId })
     } finally {
       await update($, pending, () => null)
     }
@@ -129,7 +143,7 @@ export const register: Register = on => {
 
     if (ask && element === 'dismiss') {
       await $.fs.write(
-        `${await stateDir($)}/pre-answer.json`,
+        await signalPath($, 'pre-answer'),
         JSON.stringify({ cancelled: true, at: await $.clock.now() }),
       )
       await update($, pending, () => null)
@@ -140,7 +154,7 @@ export const register: Register = on => {
     // 「我在想」：留个信号让 MCP server 放弃推微信，只等本地回答
     if (ask && element === 'hold') {
       await $.fs.write(
-        `${await stateDir($)}/hold.json`,
+        await signalPath($, 'hold'),
         JSON.stringify({ at: await $.clock.now() }),
       )
       await update($, pending, current => (current ? { ...current, held: true } : current))
@@ -152,7 +166,7 @@ export const register: Register = on => {
     const picked = ask && match ? ask.options[Number(match[1])] : undefined
     if (picked) {
       await $.fs.write(
-        `${await stateDir($)}/pre-answer.json`,
+        await signalPath($, 'pre-answer'),
         JSON.stringify({ answer: picked, at: await $.clock.now() }),
       )
       await update($, pending, () => null)
@@ -170,7 +184,7 @@ export const register: Register = on => {
       const answer = ask && index >= 0 && index < ask.options.length ? ask.options[index] : text
 
       await $.fs.write(
-        `${await stateDir($)}/pre-answer.json`,
+        await signalPath($, 'pre-answer'),
         JSON.stringify({ answer, at: await $.clock.now() }),
       )
       await update($, pending, () => null)
