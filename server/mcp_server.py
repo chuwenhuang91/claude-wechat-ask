@@ -247,6 +247,32 @@ async def _ask_local(question, options, closed_event):
     return answer
 
 
+def _drain_pending(cfg):
+    """推新问题前先排空队列，丢掉上一轮遗留的回复。
+
+    前一个问题超时放弃后，用户可能才在微信里回它。那条消息会躺在服务端，
+    下一次轮询就会把它当成本次询问的答案——你回旧问题一句、新问题就拿到了，
+    你真正回新问题的那条反倒没人再看。
+
+    拿到锁之后、send_message 之前调用，所以此后收到的消息必然是新问题发出
+    之后才产生的。短超时：有积压立刻返回，没有就等 3 秒走人。
+    """
+    try:
+        stale = claw.get_updates(cfg, timeout=3)
+    except Exception:
+        return 0
+
+    if stale:
+        _log_error(
+            {
+                "drained_stale_replies": len(stale),
+                "texts": [claw.msg_text(m)[:60] for m in stale if claw.msg_text(m)],
+            }
+        )
+
+    return len(stale)
+
+
 async def _ask_wechat(cfg, question, options, delay, closed_event, state, ask_id, deadline):
     allow_hold = ask_id is not None
 
@@ -270,6 +296,9 @@ async def _ask_wechat(cfg, question, options, delay, closed_event, state, ask_id
         return None
 
     try:
+        # 拿到锁了，先把上一轮遗留的回复冲掉，再推新问题
+        state["drained"] = await asyncio.to_thread(_drain_pending, cfg)
+
         text = question
         if options:
             listed = "\n".join(f"{i + 1}. {o}" for i, o in enumerate(options))
