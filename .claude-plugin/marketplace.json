@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "wechat-ask",
+  "description": "让 Claude 当面问你，没人理就推到微信，手机上回复即可续上",
+  "owner": { "name": "huangchuwen" },
+  "plugins": [
+    {
+      "name": "wechat-ask",
+      "description": "让 Claude 需要拿主意时当面问你；默认 30 秒没人理就把问题推到微信，在手机上回一句就能让它继续。问题画在输入框上方，点选项、打序号或直接打字都行；想慢慢想可以点「我在想」取消倒计时。需要 Python 3.9+、pip install mcp qrcode，以及微信 ClawBot（灰度功能）。",
+      "author": { "name": "huangchuwen" },
+      "category": "productivity",
+      "source": "."
+    }
+  ]
+}

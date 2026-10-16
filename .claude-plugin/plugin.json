@@ -1,0 +1,8 @@
+{
+  "name": "wechat-ask",
+  "version": "1.0.0",
+  "description": "让 Claude 当面问你，没人理就把问题推到微信，手机上回复即可续上",
+  "author": { "name": "huangchuwen" },
+  "keywords": ["wechat", "clawbot", "ask", "channel", "mcp"],
+  "types": "./types/index.d.ts"
+}
